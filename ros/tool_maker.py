@@ -16,6 +16,7 @@
 import sys
 import argparse
 import rospy
+import math
 import numpy as np
 import json
 import scipy.spatial
@@ -23,19 +24,50 @@ import scipy.optimize
 
 import geometry_msgs.msg
 
-if sys.version_info.major < 3:
-    input = raw_input
 
+class SAWToolDefinition:
+    def __init__(self, tool_id, markers, pivot=None):
+        self.id = tool_id
+        self.markers = markers
+        self.pivot = pivot
 
-# create subscription with callback to handle marker messages
+    @staticmethod
+    def from_json(json_dict):
+        def point_to_array(point):
+            return np.array([point["x"], point["y"], point["z"]])
+
+        assert json_dict.get("count", 0) == len(json_dict["fiducials"])
+        pivot = point_to_array(json_dict["pivot"]) if "pivot" in json_dict else None
+        markers = [point_to_array(f) for f in json_dict["fiducials"]]
+
+        tool_id = json_dict.get("id", None)
+
+        return SAWToolDefinition(tool_id, markers, pivot)
+
+    def to_json(self):
+        def array_to_point(array):
+            return {"x": array[0], "y": array[1], "z": array[2]}
+
+        json_dict = {}
+
+        if self.id is not None:
+            json_dict["id"] = int(self.id)
+
+        json_dict["count"] = len(self.markers)
+        json_dict["fiducials"] = [array_to_point(m) for m in self.markers]
+
+        if self.pivot is not None:
+            json_dict["pivot"] = array_to_point(self.pivot)
+
+        return json_dict
+
+# collect marker poses from specified topic
 def get_pose_data(ros_topic, expected_marker_count):
     records = []
     collecting = False
-    reference = []
 
     def display_sample_count():
-        sys.stdout.write("\rNumber of samples collected: %i" % len(records))
-        sys.stdout.flush()
+        print("Number of samples collected: %i" % len(records), end="\r")
 
     def pose_array_callback(msg):
         # skip if not recording marker pose messages
@@ -46,29 +78,19 @@ def get_pose_data(ros_topic, expected_marker_count):
         if len(msg.poses) != expected_marker_count:
             return
 
-        record = np.array([
-            (marker.position.x, marker.position.y, marker.position.z)
-            for marker in msg.poses
-        ])
+        record = np.array(
+            [
+                (marker.position.x, marker.position.y, marker.position.z)
+                for marker in msg.poses
+            ]
+        )
 
-        # use first sample as reference order
-        if reference == []:
-            reference.extend(record)
-
-        # each record has n poses but we don't know if they are sorted by markers
-        # find correspondence to reference marker that minimizes pair-wise distance
-        correspondence = scipy.spatial.distance.cdist(record, reference).argmin(axis=0)
-
-        # skip records where naive-correspondence isn't one-to-one
-        if len(np.unique(correspondence)) != len(reference):
-            return
-
-        # put record markers into the same order as the corresponding reference markers
-        ordered_record = record[correspondence]
-        records.append(ordered_record)
+        records.append(record)
         display_sample_count()
 
-    pose_array_subscriber = rospy.Subscriber(ros_topic, geometry_msgs.msg.PoseArray, pose_array_callback)
+    pose_array_subscriber = rospy.Subscriber(
+        ros_topic, geometry_msgs.msg.PoseArray, pose_array_callback
+    )
 
     input("Press Enter to start collection using topic %s" % ros_topic)
     print("Collection started\nPress Enter to stop")
@@ -80,6 +102,40 @@ def get_pose_data(ros_topic, expected_marker_count):
     pose_array_subscriber.unregister()
 
     return records
+
+
+def order_record(reference, record):
+    # each record has n poses but we don't know if they are sorted by markers
+    # find correspondence to reference marker that minimizes pair-wise distance
+    correspondence = scipy.spatial.distance.cdist(record, reference).argmin(axis=0)
+
+    # skip records where naive-correspondence isn't one-to-one
+    if len(np.unique(correspondence)) != len(reference):
+        return None
+
+    # put record markers into the same order as the corresponding reference markers
+    ordered_record = record[correspondence]
+    return ordered_record
+
+
+def kabsch_alignment(reference, record):
+    centroid_A = np.mean(reference, axis=0)
+    centroid_B = np.mean(record, axis=0)
+
+    # Align centroids to remove translation
+    A = reference - centroid_A
+    B = record - centroid_B
+    covariance = np.matmul(np.transpose(A), B)
+    u, s, vh = np.linalg.svd(covariance)
+    d = math.copysign(1, np.linalg.det(np.matmul(u, vh)))
+    C = np.diag([1, 1, d])
+
+    R = np.matmul(u, np.matmul(C, vh))
+    # T = centroid_A - np.matmul(R, centroid_B)
+
+    aligned_record = np.matmul(B, np.transpose(R))  # + T
+
+    return aligned_record
 
 
 # Apply PCA to align markers, and if is_planar to project to plane.
@@ -117,22 +173,46 @@ def principal_component_analysis(points, is_planar, planar_threshold=1e-2):
 
 
 def process_marker_records(records, is_planar):
+    # make sure markers are in same order in each record
+    ordered_records = [order_record(records[0], r) for r in records]
+    ordered_records = [r for r in ordered_records if r is not None]
+    # rotate/translate records to align all markers (minimize RMS)
+    aligned_records = [kabsch_alignment(ordered_records[0], r) for r in ordered_records]
     # average position of each marker
-    averaged_marker_poses = np.mean(records, axis=0)
-    # center (average) of individual average marker positions
-    isocenter = np.mean(averaged_marker_poses, axis=0)
-    # center coordinate system on isocenter
-    points = averaged_marker_poses - isocenter
-    # align using PCA and project to plane is is_planar flag is set
+    averaged_marker_poses = np.mean(aligned_records, axis=0)
+    # center of individual average marker positions
+    centroid = np.mean(averaged_marker_poses, axis=0)
+    # center coordinate system at centroid
+    points = averaged_marker_poses - centroid
+    # align using PCA and project to plane if is_planar flag is set
     points = principal_component_analysis(points, is_planar)
 
     return points
+
+
+def find_pivot(records, geometry, threshold=0.05):
+    # make sure markers are in same order in each record
+    ordered_records = [order_record(geometry, r) for r in records]
+    ordered_records = [r for r in ordered_records if r is not None]
+    # standard deviation of each marker's position
+    stdev = np.std(records, axis=0)
+    pivot_index = np.argmin(stdev)
+
+    # Check only pivot marker is fixed
+    for i, s in enumerate(stdev):
+        relative_stdev = stdev[pivot_index] / s
+        if i != pivot_index and relative_stdev > threshold:
+            return None
+
+    return pivot_index
+
 
 supported_units = {
     "mm": 0.001,
     "cm": 0.01,
     "m": 1.0,
 }
+
 
 def convert_units(marker_points, output_units):
     # Input marker pose data is always in meters
@@ -142,27 +222,22 @@ def convert_units(marker_points, output_units):
     return marker_points * supported_units[input_units] / supported_units[output_units]
 
 
-def write_data(points, id, output_file_name):
-    fiducials = [{"x": x, "y": y, "z": z} for [x, y, z] in points]
-    origin = {"x": 0.0, "y": 0.0, "z": 0.0}
+def read_data(file_name):
+    with open(file_name, "r") as f:
+        tool = SAWToolDefinition.from_json(f.read())
 
-    data = {
-        "count": len(fiducials),
-        "fiducials": fiducials,
-        "pivot": origin,
-    }
+    return tool
 
-    if id is not None:
-        data["id"] = id
+def write_data(points, id, output_file_name, pivot=None):
+    tool = SAWToolDefinition(id, points, pivot)
 
     with open(output_file_name, "w") as f:
-        json.dump(data, f, indent=4, sort_keys=True)
+        json.dump(tool.to_json(), f, indent=4, sort_keys=True)
         f.write("\n")
 
     print("Generated tool geometry file {}".format(output_file_name))
 
-
-if __name__ == "__main__":
+def main():
     # ros init node so we can use default ros arguments (e.g. __ns:= for namespace)
     rospy.init_node("tool_maker", anonymous=True)
     # strip ros arguments
@@ -199,6 +274,12 @@ if __name__ == "__main__":
         help="indicates all markers lie in a plane",
     )
     parser.add_argument(
+        "-v",
+        "--pivot",
+        action="store_true",
+        help="compute pivot",
+    )
+    parser.add_argument(
         "-i", "--id", type=int, required=False, help="specify optional id"
     )
     parser.add_argument(
@@ -219,8 +300,17 @@ if __name__ == "__main__":
     # create the callback that will collect data
     records = get_pose_data(args.topic, args.number_of_markers)
     if len(records) < minimum_records_required:
-        sys.exit("Not enough records ({} minimum)".format(minimum_records_required))
+        print("Not enough records ({} minimum)".format(minimum_records_required))
+        return
 
-    points = process_marker_records(records, args.planar)
-    points = convert_units(points, args.units)
-    write_data(points, args.id, args.output)
+    if args.pivot:
+        tool = read_data(args.output)
+        pivot_index = find_pivot(records, tool.markers)
+        write_data(tool.markers, args.id or tool.id, args.output, pivot=tool.markers[pivot_index])
+    else:
+        points = process_marker_records(records, args.planar)
+        points = convert_units(points, args.units)
+        write_data(points, args.id, args.output)
+
+if __name__ == "__main__":
+    main()
