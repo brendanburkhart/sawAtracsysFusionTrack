@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 
-# Author: Anton Deguet
+# Author: Anton Deguet, Brendan Burkhart
 # Date: 2021-10-29
 
-# (C) Copyright 2021 Johns Hopkins University (JHU), All Rights Reserved.
+# (C) Copyright 2021-2022 Johns Hopkins University (JHU), All Rights Reserved.
 
 # --- begin cisst license - do not edit ---
 
@@ -16,11 +16,9 @@
 import sys
 import argparse
 import rospy
-import math
 import numpy as np
 import json
-import scipy.spatial
-import scipy.optimize
+import registration
 
 import geometry_msgs.msg
 
@@ -38,7 +36,7 @@ class SAWToolDefinition:
 
         assert json_dict.get("count", 0) == len(json_dict["fiducials"])
         pivot = point_to_array(json_dict["pivot"]) if "pivot" in json_dict else None
-        markers = [point_to_array(f) for f in json_dict["fiducials"]]
+        markers = np.array([point_to_array(f) for f in json_dict["fiducials"]])
 
         tool_id = json_dict.get("id", None)
 
@@ -61,87 +59,90 @@ class SAWToolDefinition:
 
         return json_dict
 
-# collect marker poses from specified topic
-def get_pose_data(ros_topic, expected_marker_count):
-    records = []
-    collecting = False
+def error_threshold(geometry, factor=0.2):
+    _, distance = registration.nearest_pair(geometry)
+    return distance*factor
 
-    def display_sample_count():
-        print("Number of samples collected: %i" % len(records), end="\r")
+class SampleStream:
+    def __init__(self, ros_topic, reference_geometry=None, marker_count=None):
+        self.ros_topic = ros_topic
+        self.reference_geometry = reference_geometry
+        self.marker_count = marker_count
 
-    def pose_array_callback(msg):
-        # skip if not recording marker pose messages
-        if not collecting:
-            return
+        self.collecting = False
+        self.samples = []
+        self.previous_sample = None
 
-        # make sure the number of poses matches the number of expected markers
-        if len(msg.poses) != expected_marker_count:
-            return
+        if reference_geometry is not None:
+            self.add_reference_geometry(reference_geometry)
 
-        record = np.array(
-            [
-                (marker.position.x, marker.position.y, marker.position.z)
-                for marker in msg.poses
-            ]
+        if reference_geometry is None and marker_count is None:
+            raise ValueError(
+                "either reference_geometry or marker_count must be specified"
+            )
+
+        self.data_subscriber = rospy.Subscriber(
+            ros_topic, geometry_msgs.msg.PoseArray, self._sample_callback
         )
 
-        records.append(record)
-        display_sample_count()
+    def unregister(self):
+        self.data_subscriber.unregister()
 
-    pose_array_subscriber = rospy.Subscriber(
-        ros_topic, geometry_msgs.msg.PoseArray, pose_array_callback
-    )
+    def add_reference_geometry(self, geometry):
+        self.reference_geometry = geometry
+        self.marker_count = len(self.reference_geometry)
+        self.maximum_marker_error = error_threshold(self.reference_geometry)
 
-    input("Press Enter to start collection using topic %s" % ros_topic)
-    print("Collection started\nPress Enter to stop")
-    display_sample_count()
-    collecting = True
+    def _display_sample_count(self):
+        print("Number of samples collected: {}".format(len(self.samples)), end="\r")
 
-    input("")
-    collecting = False
-    pose_array_subscriber.unregister()
+    def _sample_callback(self, message):
+        if not self.collecting or len(message.poses) != self.marker_count:
+            self.previous_sample = None
+            return
 
-    return records
+        point = lambda pose: [pose.position.x, pose.position.y, pose.position.z]
+        sample = np.array([point(marker) for marker in message.poses])
 
+        if self.previous_sample is not None and registration.nearest_neighbor(self.previous_sample, sample) is not None:
+            sample = sample[registration.nearest_neighbor(self.previous_sample, sample)]
+        self.previous_sample = sample
 
-def order_record(reference, record):
-    # each record has n poses but we don't know if they are sorted by markers
-    # find correspondence to reference marker that minimizes pair-wise distance
-    correspondence = scipy.spatial.distance.cdist(record, reference).argmin(axis=0)
+        if self.reference_geometry is not None:
+            _, _, error = registration.iterative_closest_point(self.reference_geometry, sample, initial_order=True)
+            if error > self.maximum_marker_error:
+                self.previous_sample = None
+                return
+        
+        self.samples.append(sample)
+        self._display_sample_count()
 
-    # skip records where naive-correspondence isn't one-to-one
-    if len(np.unique(correspondence)) != len(reference):
-        return None
+    def collect_n(self, sample_count):
+        self.samples = []
+        self._display_sample_count()
+        self.collecting = True
 
-    # put record markers into the same order as the corresponding reference markers
-    ordered_record = record[correspondence]
-    return ordered_record
+        while not rospy.is_shutdown() and len(self.samples) < sample_count:
+            rospy.sleep(0.05)
 
+        self.collecting = False
+        return np.array(self.samples[:sample_count])
 
-def kabsch_alignment(reference, record):
-    centroid_A = np.mean(reference, axis=0)
-    centroid_B = np.mean(record, axis=0)
+    def collect(self):
+        print("Collection started, press 'enter' to stop")
+        self.samples = []
+        self._display_sample_count()
+        self.collecting = True
 
-    # Align centroids to remove translation
-    A = reference - centroid_A
-    B = record - centroid_B
-    covariance = np.matmul(np.transpose(A), B)
-    u, s, vh = np.linalg.svd(covariance)
-    d = math.copysign(1, np.linalg.det(np.matmul(u, vh)))
-    C = np.diag([1, 1, d])
+        input()
+        self.collecting = False
+        print()
 
-    R = np.matmul(u, np.matmul(C, vh))
-    # T = centroid_A - np.matmul(R, centroid_B)
+        return np.array(self.samples)
 
-    aligned_record = np.matmul(B, np.transpose(R))  # + T
-
-    return aligned_record
-
-
-# Apply PCA to align markers, and if is_planar to project to plane.
+# apply PCA to align coordinate system to marker geometry
 # Points data should have mean zero (i.e. be centered at origin).
-# planar_threshold is maximium relative variance along third axis that is considerd planar
-def principal_component_analysis(points, is_planar, planar_threshold=1e-2):
+def principal_component_analysis(points):
     # SVD for PCA
     _, sigma, Vt = np.linalg.svd(points, full_matrices=False)
 
@@ -151,61 +152,39 @@ def principal_component_analysis(points, is_planar, planar_threshold=1e-2):
     if basis_orientation < 0.0:
         Vt[2, :] = -Vt[2, :]
 
-    # Three markers will always be planar, so we can ignore minor computation errors
-    marker_count = np.size(is_planar)
-    is_planar = is_planar or marker_count == 3
-
-    # Project markers to best-fit plane
-    if is_planar:
-        print("Planar flag enabled, projecting markers onto plane...")
-        # Remove 3rd (smallest) principal componenent to collapse points to plane
-        Vt[2, :] = 0
-
-    planarity = sigma[2] / sigma[1]
-    if is_planar and planarity > planar_threshold:
-        print("WARNING: planar flag is enabled, but markers don't appear to be planar!")
-    elif not is_planar and planarity < planar_threshold:
-        print(
-            "Markers appear to be planar. If so, add '--planar' flag for better results"
-        )
-
     return np.matmul(points, Vt.T)
 
 
-def process_marker_records(records, is_planar):
-    # make sure markers are in same order in each record
-    ordered_records = [order_record(records[0], r) for r in records]
-    ordered_records = [r for r in ordered_records if r is not None]
-    # rotate/translate records to align all markers (minimize RMS)
-    aligned_records = [kabsch_alignment(ordered_records[0], r) for r in ordered_records]
+# given samples, determine tool geometry
+def determine_geometry(samples):
+    def align_markers(markers):
+        order, (R, t), _ = registration.iterative_closest_point(samples[0], markers, initial_order=True)
+        ordered_markers = markers[order]
+        aligned_markers = np.matmul(ordered_markers, R.T) + t
+        return aligned_markers
+
+    # rotate/translate samples to align all markers (minimize RMS)
+    aligned_samples = [align_markers(s) for s in samples]
     # average position of each marker
-    averaged_marker_poses = np.mean(aligned_records, axis=0)
+    averaged_markers = np.mean(aligned_samples, axis=0)
     # center of individual average marker positions
-    centroid = np.mean(averaged_marker_poses, axis=0)
+    centroid = np.mean(averaged_markers, axis=0)
     # center coordinate system at centroid
-    points = averaged_marker_poses - centroid
-    # align using PCA and project to plane if is_planar flag is set
-    points = principal_component_analysis(points, is_planar)
+    markers = averaged_markers - centroid
+    error = registration.rms_error(aligned_samples, averaged_markers)
+    # align using PCA
+    geometry = principal_component_analysis(markers)
 
-    return points
+    return geometry, error
 
+# given samples where one pivot marker was kept relatively still,
+# determine pivot marker and return its index within the reference geometry
+def determine_pivot(records, geometry):
+    _, (R, t), _ = registration.iterative_closest_point(geometry, records[0])
+    pivot, error = registration.determine_pivot(records)
+    pivot = np.matmul(R, pivot) + t
 
-def find_pivot(records, geometry, threshold=0.05):
-    # make sure markers are in same order in each record
-    ordered_records = [order_record(geometry, r) for r in records]
-    ordered_records = [r for r in ordered_records if r is not None]
-    # standard deviation of each marker's position
-    stdev = np.std(records, axis=0)
-    pivot_index = np.argmin(stdev)
-
-    # Check only pivot marker is fixed
-    for i, s in enumerate(stdev):
-        relative_stdev = stdev[pivot_index] / s
-        if i != pivot_index and relative_stdev > threshold:
-            return None
-
-    return pivot_index
-
+    return pivot, error
 
 supported_units = {
     "mm": 0.001,
@@ -213,7 +192,7 @@ supported_units = {
     "m": 1.0,
 }
 
-
+# given marker points in meters, convert to desired units
 def convert_units(marker_points, output_units):
     # Input marker pose data is always in meters
     input_units = "m"
@@ -224,18 +203,65 @@ def convert_units(marker_points, output_units):
 
 def read_data(file_name):
     with open(file_name, "r") as f:
-        tool = SAWToolDefinition.from_json(f.read())
+        json_dict = json.load(f)
 
-    return tool
+    return SAWToolDefinition.from_json(json_dict)
+
 
 def write_data(points, id, output_file_name, pivot=None):
     tool = SAWToolDefinition(id, points, pivot)
 
     with open(output_file_name, "w") as f:
-        json.dump(tool.to_json(), f, indent=4, sort_keys=True)
+        json_dict = tool.to_json()
+        json.dump(json_dict, f, indent=4, sort_keys=True)
         f.write("\n")
 
     print("Generated tool geometry file {}".format(output_file_name))
+
+
+def create_tool(args, minimum_samples=10):
+    data_stream = SampleStream(args.topic, marker_count=args.num_markers)
+    reference_geometry = None
+    
+    input(f"Press 'enter' to start collection using topic {args.topic}")
+    while not rospy.is_shutdown() and reference_geometry is None:
+        reference_snapshot = data_stream.collect_n(minimum_samples)
+        if len(reference_snapshot) < minimum_samples:
+            print("ERROR: failed to collect reference snapshot")
+            return
+
+        max_error = min([error_threshold(s) for s in reference_snapshot])
+        measured_geometry, error = determine_geometry(reference_snapshot)
+        if error < max_error:
+            reference_geometry = measured_geometry
+
+    data_stream.add_reference_geometry(reference_geometry)
+    samples = data_stream.collect()
+    if len(samples) < minimum_samples:
+        print("Not enough samples collected ({} minimum)".format(minimum_samples))
+        return
+
+    geometry, error = determine_geometry(samples)
+    print("RMS error of measured geometry: {:.3f}".format(1e3*error))
+    geometry = convert_units(geometry, args.units)
+    write_data(geometry, args.id, args.file)
+
+
+def measure_pivot(args, minimum_samples=20):
+    tool = read_data(args.file)
+    geometry = 1e-3*tool.markers
+    data_stream = SampleStream(args.topic, reference_geometry=geometry)
+
+    input(f"Press 'enter' to start collection using topic {args.topic}")
+    samples = data_stream.collect()
+    if len(samples) < minimum_samples:
+        print("Not enough samples collected ({} minimum)".format(minimum_samples))
+        return
+
+    samples = convert_units(samples, args.units)
+    pivot, error = determine_pivot(samples, tool.markers)
+    print("RMS error of measured pivot: {:.3f}".format(1e3*error))
+    write_data(tool.markers, tool.id, args.file, pivot=pivot)
 
 def main():
     # ros init node so we can use default ros arguments (e.g. __ns:= for namespace)
@@ -245,6 +271,12 @@ def main():
 
     # parse arguments
     parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(
+        title="commands",
+        help="see each command for additional help",
+        dest="command",
+        required=True,
+    )
 
     # required arguments
     parser.add_argument(
@@ -255,32 +287,27 @@ def main():
         help="topic to use to receive PoseArray without namespace. Use __ns:= to specify the namespace",
     )
     parser.add_argument(
+        "-f", "--file", type=str, required=True, help="output file name"
+    )
+
+    pivot_parser = subparsers.add_parser(
+        "pivot", aliases=["p"], help="determine tool pivot"
+    )
+    pivot_parser.set_defaults(command_func=measure_pivot)
+    create_parser = subparsers.add_parser(
+        "create", aliases=["c"], help="create a new tool definition"
+    )
+    create_parser.set_defaults(command_func=create_tool)
+    create_parser.add_argument(
         "-n",
-        "--number-of-markers",
+        "--num_markers",
         type=int,
         choices=range(3, 10),
         required=True,
         help="number of markers on the tool. Used to filter messages with incorrect number of markers",
     )
-    parser.add_argument(
-        "-o", "--output", type=str, required=True, help="output file name"
-    )
-
-    # optional arguments
-    parser.add_argument(
-        "-p",
-        "--planar",
-        action="store_true",
-        help="indicates all markers lie in a plane",
-    )
-    parser.add_argument(
-        "-v",
-        "--pivot",
-        action="store_true",
-        help="compute pivot",
-    )
-    parser.add_argument(
-        "-i", "--id", type=int, required=False, help="specify optional id"
+    create_parser.add_argument(
+        "-i", "--id", type=int, required=False, help="specify optional tool id"
     )
     parser.add_argument(
         "-u",
@@ -292,25 +319,9 @@ def main():
         help="units to use for output data in tool config",
     )
 
-    args = parser.parse_args(argv[1:])  # skip argv[0], script name
+    args = parser.parse_args()
+    args.command_func(args)
 
-    # Arbitrary number to make sure we have enough records to average out noise etc.
-    minimum_records_required = 10
-
-    # create the callback that will collect data
-    records = get_pose_data(args.topic, args.number_of_markers)
-    if len(records) < minimum_records_required:
-        print("Not enough records ({} minimum)".format(minimum_records_required))
-        return
-
-    if args.pivot:
-        tool = read_data(args.output)
-        pivot_index = find_pivot(records, tool.markers)
-        write_data(tool.markers, args.id or tool.id, args.output, pivot=tool.markers[pivot_index])
-    else:
-        points = process_marker_records(records, args.planar)
-        points = convert_units(points, args.units)
-        write_data(points, args.id, args.output)
 
 if __name__ == "__main__":
     main()
